@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT="${0:A:h}"
-APP="$ROOT/build/CodeX Usage Bar.app"
+APP="$ROOT/build/Usage Bar for CodeX.app"
 ICONSET="$ROOT/build/AppIcon.iconset"
 rm -rf "$ICONSET"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" "$ICONSET"
