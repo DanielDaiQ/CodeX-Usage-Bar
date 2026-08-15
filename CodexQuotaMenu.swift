@@ -1,5 +1,14 @@
 import AppKit
 import Foundation
+import ServiceManagement
+
+private var usesChinese: Bool {
+    Locale.preferredLanguages.first?.lowercased().hasPrefix("zh") == true
+}
+
+private func tr(_ chinese: String, _ english: String) -> String {
+    usesChinese ? chinese : english
+}
 
 struct QuotaWindow {
     let used: Double
@@ -167,20 +176,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let menu = NSMenu()
     private var snapshot = Snapshot()
     private var lastProjectRefresh = Date.distantPast
+    private var refreshTimer: Timer?
     private let defaults = UserDefaults.standard
+    private let codexBundleID = "com.openai.codex"
 
     private var showWeekly: Bool {
         get { defaults.object(forKey: "showWeekly") as? Bool ?? true }
         set { defaults.set(newValue, forKey: "showWeekly") }
     }
 
+    private var followCodexLaunch: Bool {
+        get { defaults.bool(forKey: "followCodexLaunch") }
+        set { defaults.set(newValue, forKey: "followCodexLaunch") }
+    }
+
+    private var followCodexQuit: Bool {
+        get { defaults.bool(forKey: "followCodexQuit") }
+        set { defaults.set(newValue, forKey: "followCodexQuit") }
+    }
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         menu.delegate = self
         statusItem.menu = menu
-        statusItem.button?.toolTip = "CodeX Usage Bar（每周剩余）"
+        statusItem.button?.toolTip = tr("CodeX Usage Bar（每周剩余）", "CodeX Usage Bar (weekly remaining)")
         statusItem.button?.imagePosition = .imageLeading
+        observeCodexLifecycle()
+        refreshTimer = Timer.scheduledTimer(withTimeInterval: 10 * 60, repeats: true) { [weak self] _ in
+            self?.refresh()
+        }
         refresh()
         rebuildMenu()
+        if followCodexLaunch && !isCodexRunning { statusItem.isVisible = false }
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        refreshTimer?.invalidate()
+        NSWorkspace.shared.notificationCenter.removeObserver(self)
     }
 
     func menuWillOpen(_ menu: NSMenu) {
@@ -209,13 +240,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func rebuildMenu() {
         menu.removeAllItems()
         addHeader("CodeX Usage Bar")
-        addQuota("每周余量", snapshot.weekly)
+        addQuota(tr("每周余量", "Weekly Remaining"), snapshot.weekly)
 
         menu.addItem(.separator())
-        addHeader("本机近 7 天项目用量")
+        addHeader(tr("本机近 7 天项目用量", "Local Project Usage · 7 Days"))
         let total = max(1, snapshot.projects.reduce(Int64(0)) { $0 + $1.tokens })
         if snapshot.projects.isEmpty {
-            addDisabled("暂无本地项目数据")
+            addDisabled(tr("暂无本地项目数据", "No local project data"))
         } else {
             for project in snapshot.projects {
                 let share = Double(project.tokens) / Double(total) * 100
@@ -224,14 +255,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
 
         menu.addItem(.separator())
-        addToggle("菜单栏显示每周余量", action: #selector(toggleWeekly), enabled: showWeekly)
+        addToggle(tr("菜单栏显示每周余量", "Show weekly remaining in menu bar"), action: #selector(toggleWeekly), enabled: showWeekly)
+        addToggle(tr("Codex 启动时显示 Usage Bar", "Show Usage Bar when Codex opens"), action: #selector(toggleFollowCodexLaunch), enabled: followCodexLaunch)
+        addToggle(tr("Codex 退出时隐藏 Usage Bar", "Hide Usage Bar when Codex quits"), action: #selector(toggleFollowCodexQuit), enabled: followCodexQuit)
         if let updated = snapshot.updatedAt {
-            addDisabled("本地记录更新：\(dateText(updated))")
+            addDisabled(tr("本地记录更新：", "Local record updated: ") + dateText(updated))
         } else {
-            addDisabled("未找到 Codex 余量记录")
+            addDisabled(tr("未找到 Codex 余量记录", "No Codex usage record found"))
         }
         menu.addItem(.separator())
-        let quit = NSMenuItem(title: "退出 App", action: #selector(quitApp), keyEquivalent: "q")
+        let quit = NSMenuItem(title: tr("退出 App", "Quit App"), action: #selector(quitApp), keyEquivalent: "q")
         quit.target = self
         menu.addItem(quit)
     }
@@ -255,10 +288,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func addQuota(_ title: String, _ window: QuotaWindow?) {
         guard let window else {
-            addRow(title: title, detail: "本机最新记录未返回此窗口", value: 0)
+            addRow(title: title, detail: tr("本机最新记录未返回此窗口", "Latest local record did not include this window"), value: 0)
             return
         }
-        addRow(title: "\(title)  \(Int(window.remaining.rounded()))%", detail: "重置：\(dateText(window.reset))", value: window.remaining)
+        addRow(title: "\(title)  \(Int(window.remaining.rounded()))%", detail: tr("重置：", "Resets: ") + dateText(window.reset), value: window.remaining)
     }
 
     private func addRow(title: String, detail: String, value: Double) {
@@ -286,8 +319,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func dateText(_ date: Date) -> String {
         let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "zh_CN")
-        formatter.dateFormat = Calendar.current.isDateInToday(date) ? "今天 HH:mm" : "M月d日 HH:mm"
+        formatter.locale = .current
+        formatter.dateFormat = Calendar.current.isDateInToday(date)
+            ? (usesChinese ? "今天 HH:mm" : "'Today' HH:mm")
+            : (usesChinese ? "M月d日 HH:mm" : "MMM d HH:mm")
         return formatter.string(from: date)
     }
 
@@ -301,6 +336,61 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         showWeekly.toggle()
         updateTitle()
         rebuildMenu()
+    }
+
+    @objc private func toggleFollowCodexLaunch() {
+        followCodexLaunch.toggle()
+        updateLoginItem()
+        statusItem.isVisible = !followCodexLaunch || isCodexRunning
+        rebuildMenu()
+    }
+
+    @objc private func toggleFollowCodexQuit() {
+        followCodexQuit.toggle()
+        updateLoginItem()
+        if !followCodexQuit { statusItem.isVisible = true }
+        rebuildMenu()
+    }
+
+    private var isCodexRunning: Bool {
+        !NSRunningApplication.runningApplications(withBundleIdentifier: codexBundleID).isEmpty
+    }
+
+    private func observeCodexLifecycle() {
+        let center = NSWorkspace.shared.notificationCenter
+        center.addObserver(self, selector: #selector(workspaceAppLaunched(_:)), name: NSWorkspace.didLaunchApplicationNotification, object: nil)
+        center.addObserver(self, selector: #selector(workspaceAppTerminated(_:)), name: NSWorkspace.didTerminateApplicationNotification, object: nil)
+        updateLoginItem()
+    }
+
+    @objc private func workspaceAppLaunched(_ notification: Notification) {
+        guard followCodexLaunch, bundleID(from: notification) == codexBundleID else { return }
+        statusItem.isVisible = true
+        refresh()
+        rebuildMenu()
+    }
+
+    @objc private func workspaceAppTerminated(_ notification: Notification) {
+        guard followCodexQuit, bundleID(from: notification) == codexBundleID else { return }
+        statusItem.isVisible = false
+    }
+
+    private func bundleID(from notification: Notification) -> String? {
+        (notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication)?.bundleIdentifier
+    }
+
+    private func updateLoginItem() {
+        guard #available(macOS 13.0, *) else { return }
+        let service = SMAppService.mainApp
+        do {
+            if followCodexLaunch || followCodexQuit {
+                if service.status != .enabled { try service.register() }
+            } else if service.status == .enabled {
+                try service.unregister()
+            }
+        } catch {
+            // The menu settings remain useful for the current session even if macOS declines login-item registration.
+        }
     }
 
     private func appIcon() -> NSImage? {
