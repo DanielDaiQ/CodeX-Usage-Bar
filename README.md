@@ -36,7 +36,7 @@ No Codex login, API key, browser access, or network connection is required. The 
 
 ```bash
 zsh build.sh
-open "build/CodeX Usage Bar.app"
+open "build/Usage Bar for CodeX.app"
 ```
 
 The build script uses only Apple's command-line tools and creates an ad-hoc signed app. Public release builds are not Apple-notarized, so on first launch use Control-click → **Open** if Gatekeeper asks.
