@@ -198,7 +198,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         menu.delegate = self
         statusItem.menu = menu
-        statusItem.button?.toolTip = tr("CodeX Usage Bar（每周剩余）", "CodeX Usage Bar (weekly remaining)")
+        statusItem.button?.toolTip = tr("Usage Bar for CodeX（每周剩余）", "Usage Bar for CodeX (weekly remaining)")
         statusItem.button?.imagePosition = .imageLeading
         observeCodexLifecycle()
         refreshTimer = Timer.scheduledTimer(withTimeInterval: 10 * 60, repeats: true) { [weak self] _ in
@@ -239,7 +239,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func rebuildMenu() {
         menu.removeAllItems()
-        addHeader("CodeX Usage Bar")
+        addHeader("Usage Bar for CodeX")
         addQuota(tr("每周余量", "Weekly Remaining"), snapshot.weekly)
 
         menu.addItem(.separator())
