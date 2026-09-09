@@ -1,8 +1,12 @@
 # Usage Bar for CodeX
 
-A native macOS menu-bar app for Codex quota and local project usage. Version **1.5 (build 10)**.
+A native macOS menu-bar app for Codex quota and local project usage. Version **1.5.1 (build 11)**.
 
 ![CodeX Usage Bar icon](AppIcon.png)
+
+## Latest update
+
+v1.5.1 uses the preferred black-and-green icon supplied in CODEX BAR.psd, with the exterior white background removed and transparent rounded corners. App functionality is unchanged from v1.5.0.
 
 ## Download and install
 
