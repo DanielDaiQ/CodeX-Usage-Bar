@@ -10,6 +10,73 @@ private func tr(_ chinese: String, _ english: String) -> String {
     usesChinese ? chinese : english
 }
 
+final class CodexFolderAccess {
+    static let shared = CodexFolderAccess()
+
+    private let bookmarkKey = "codexFolderBookmark"
+    private var activeURL: URL?
+
+    func currentURL() -> URL? {
+        if let activeURL { return activeURL }
+        guard let data = UserDefaults.standard.data(forKey: bookmarkKey) else {
+            // The locally built app is not sandboxed, so it can read the local
+            // Codex folder without repeatedly asking for folder permission.
+            let localCodex = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".codex")
+            if ProcessInfo.processInfo.environment["APP_SANDBOX_CONTAINER_ID"] == nil,
+               FileManager.default.fileExists(atPath: localCodex.path) {
+                return localCodex
+            }
+            return nil
+        }
+        var stale = false
+        guard let url = try? URL(
+            resolvingBookmarkData: data,
+            options: .withSecurityScope,
+            relativeTo: nil,
+            bookmarkDataIsStale: &stale
+        ) else { return nil }
+        guard url.lastPathComponent == ".codex" || url.lastPathComponent == "sessions" else {
+            UserDefaults.standard.removeObject(forKey: bookmarkKey)
+            return nil
+        }
+        guard url.startAccessingSecurityScopedResource() else { return nil }
+        activeURL = url
+        if stale { saveBookmark(for: url) }
+        return url
+    }
+
+    func chooseFolder() -> URL? {
+        let panel = NSOpenPanel()
+        panel.title = tr("选择 Codex 数据文件夹", "Choose Codex Data Folder")
+        panel.message = tr("请选择 .codex 中的 sessions 文件夹。AI Usage Bar 只会读取其中的本地记录。", "Choose the sessions folder inside .codex. AI Usage Bar reads local records only.")
+        panel.prompt = tr("授权只读访问", "Allow Read-Only Access")
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.showsHiddenFiles = true
+        panel.directoryURL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".codex")
+        panel.nameFieldStringValue = "sessions"
+        guard panel.runModal() == .OK, let url = panel.url,
+              (url.lastPathComponent == ".codex" || url.lastPathComponent == "sessions"),
+              (try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true else { return nil }
+
+        if let activeURL { activeURL.stopAccessingSecurityScopedResource() }
+        guard url.startAccessingSecurityScopedResource() else { return nil }
+        activeURL = url
+        saveBookmark(for: url)
+        return url
+    }
+
+    private func saveBookmark(for url: URL) {
+        guard let data = try? url.bookmarkData(
+            options: .withSecurityScope,
+            includingResourceValuesForKeys: nil,
+            relativeTo: nil
+        ) else { return }
+        UserDefaults.standard.set(data, forKey: bookmarkKey)
+    }
+}
+
 struct QuotaWindow {
     let used: Double
     let minutes: Int
@@ -23,37 +90,63 @@ struct ProjectUsage {
 }
 
 struct Snapshot {
+    var fiveHour: QuotaWindow?
     var weekly: QuotaWindow?
+    var creditBalance: Double?
     var projects: [ProjectUsage] = []
     var updatedAt: Date?
+    var isLiveCodexData = false
 }
 
 enum LocalCodexReader {
-    static let roots = [
-        FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".codex/sessions"),
-        FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".codex/archived_sessions")
-    ]
+    static var roots: [URL] {
+        guard let root = CodexFolderAccess.shared.currentURL() else { return [] }
+        if root.lastPathComponent == "sessions" { return [root] }
+        return [root.appendingPathComponent("sessions"), root.appendingPathComponent("archived_sessions")]
+    }
 
     static func snapshot(includeProjects: Bool = true) -> Snapshot {
         let files = logFiles()
         var result = Snapshot()
+        let records = files.compactMap { file -> (LogFile, Record)? in
+            guard let record = latestRecord(in: file.url) else { return nil }
+            return (file, record)
+        }
 
-        for file in files.prefix(20) {
-            guard let record = latestRecord(in: file.url) else { continue }
-            if result.updatedAt == nil, let limits = record.limits {
-                result.updatedAt = record.timestamp ?? file.modified
-                for window in limits {
-                    if window.minutes == 10_080 { result.weekly = window }
+        // A session file can be touched long after its last quota event.  Pick
+        // the most recent event timestamp instead of the filesystem mtime.
+        func latestCodexRecord(for minutes: Int) -> (LogFile, Record)? {
+            records
+                .filter {
+                    $0.1.limitID == "codex" &&
+                    $0.1.limits?.contains(where: { $0.minutes == minutes }) == true
                 }
-                break
-            }
+                .max { lhs, rhs in
+                    let leftDate = lhs.1.timestamp ?? lhs.0.modified
+                    let rightDate = rhs.1.timestamp ?? rhs.0.modified
+                    return leftDate < rightDate
+                }
+        }
+
+        let latestWeekly = latestCodexRecord(for: 10_080)
+        let latestFiveHour = latestCodexRecord(for: 300)
+        if let latestFiveHour {
+            result.fiveHour = latestFiveHour.1.limits?.first { $0.minutes == 300 }
+        }
+        if let latestWeekly {
+            let file = latestWeekly.0
+            let record = latestWeekly.1
+            result.updatedAt = record.timestamp ?? file.modified
+            result.weekly = record.limits?.first { $0.minutes == 10_080 }
+            result.creditBalance = record.creditBalance
         }
 
         if includeProjects {
             let cutoff = Date().addingTimeInterval(-7 * 24 * 60 * 60)
             var totals: [String: Int64] = [:]
-            for file in files where file.modified >= cutoff {
-                guard let record = latestRecord(in: file.url), record.tokens > 0 else { continue }
+            for (file, record) in records {
+                let eventDate = record.timestamp ?? file.modified
+                guard eventDate >= cutoff, record.tokens > 0 else { continue }
                 let name = record.cwd.map { URL(fileURLWithPath: $0).lastPathComponent } ?? "其他"
                 totals[name, default: 0] += record.tokens
             }
@@ -68,6 +161,8 @@ enum LocalCodexReader {
         var tokens: Int64 = 0
         var cwd: String?
         var timestamp: Date?
+        var creditBalance: Double?
+        var limitID: String?
     }
 
     private static func logFiles() -> [LogFile] {
@@ -110,12 +205,18 @@ enum LocalCodexReader {
                 record.timestamp = ISO8601DateFormatter().date(from: stamp)
             }
             if let limits = payload["rate_limits"] as? [String: Any] {
+                record.limitID = limits["limit_id"] as? String
                 record.limits = ["primary", "secondary"].compactMap { key in
                     guard let item = limits[key] as? [String: Any],
                           let used = number(item["used_percent"]),
                           let minutes = item["window_minutes"] as? Int,
                           let reset = number(item["resets_at"]) else { return nil }
                     return QuotaWindow(used: used, minutes: minutes, reset: Date(timeIntervalSince1970: reset))
+                }
+                if let credits = limits["credits"] as? [String: Any],
+                   credits["unlimited"] as? Bool != true,
+                   let balance = number(credits["balance"]) {
+                    record.creditBalance = balance
                 }
             }
         }
@@ -148,6 +249,114 @@ enum LocalCodexReader {
     }
 }
 
+/// Reads the same rate-limit snapshot exposed by the locally installed Codex
+/// app-server. This avoids treating archived session JSONL files as live usage.
+enum CodexAppServerReader {
+    private static let executable = "/Applications/ChatGPT.app/Contents/Resources/codex"
+
+    static func liveSnapshot() -> Snapshot? {
+        guard FileManager.default.isExecutableFile(atPath: executable) else { return nil }
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: executable)
+        process.arguments = ["app-server", "--listen", "stdio://"]
+        let input = Pipe()
+        let output = Pipe()
+        process.standardInput = input
+        process.standardOutput = output
+        process.standardError = FileHandle.nullDevice
+
+        do {
+            try process.run()
+        } catch {
+            return nil
+        }
+
+        let timeout = DispatchWorkItem { if process.isRunning { process.terminate() } }
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 25, execute: timeout)
+        defer {
+            timeout.cancel()
+            try? input.fileHandleForWriting.close()
+            if process.isRunning { process.terminate() }
+            process.waitUntilExit()
+        }
+
+        func send(_ object: [String: Any]) {
+            guard let data = try? JSONSerialization.data(withJSONObject: object) else { return }
+            input.fileHandleForWriting.write(data)
+            input.fileHandleForWriting.write(Data("\n".utf8))
+        }
+
+        send([
+            "id": 1,
+            "method": "initialize",
+            "params": [
+                "clientInfo": ["name": "CodeX Usage Bar", "version": "1.5"],
+                "capabilities": ["experimentalApi": false],
+            ],
+        ])
+        // Wait for protocol responses, not an arbitrary startup delay. Keep
+        // stdin open until the account response arrives or the deadline fires.
+        var pending = Data()
+        var response: [String: Any]?
+        while response == nil {
+            let chunk = output.fileHandleForReading.availableData
+            if chunk.isEmpty { break }
+            pending.append(chunk)
+            while let newline = pending.firstIndex(of: 10) {
+                let line = Data(pending[..<newline])
+                pending.removeSubrange(...newline)
+                guard let item = try? JSONSerialization.jsonObject(with: line) as? [String: Any] else { continue }
+                if (item["id"] as? Int) == 1 {
+                    guard item["result"] != nil else { return nil }
+                    send(["method": "initialized"])
+                    send(["id": 2, "method": "account/rateLimits/read", "params": NSNull()])
+                } else if (item["id"] as? Int) == 2 {
+                    response = item
+                    break
+                }
+            }
+        }
+        guard let response,
+              let data = try? JSONSerialization.data(withJSONObject: response),
+              let text = String(data: data, encoding: .utf8) else { return nil }
+
+        for line in text.split(separator: "\n") {
+            guard let item = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],
+                  (item["id"] as? NSNumber)?.intValue == 2,
+                  let result = item["result"] as? [String: Any],
+                  let limits = result["rateLimits"] as? [String: Any],
+                  limits["limitId"] as? String == "codex" else { continue }
+
+            var snapshot = Snapshot()
+            snapshot.fiveHour = window(limits["primary"])
+            snapshot.weekly = window(limits["secondary"])
+            if let credits = limits["credits"] as? [String: Any],
+               credits["unlimited"] as? Bool != true {
+                snapshot.creditBalance = number(credits["balance"])
+            }
+            snapshot.updatedAt = Date()
+            snapshot.isLiveCodexData = snapshot.fiveHour != nil || snapshot.weekly != nil
+            return snapshot.isLiveCodexData ? snapshot : nil
+        }
+        return nil
+    }
+
+    private static func window(_ value: Any?) -> QuotaWindow? {
+        guard let item = value as? [String: Any],
+              let used = number(item["usedPercent"]),
+              let minutes = (item["windowDurationMins"] as? NSNumber)?.intValue,
+              let reset = number(item["resetsAt"]) else { return nil }
+        return QuotaWindow(used: used, minutes: minutes, reset: Date(timeIntervalSince1970: reset))
+    }
+
+    private static func number(_ value: Any?) -> Double? {
+        if let number = value as? NSNumber { return number.doubleValue }
+        if let string = value as? String { return Double(string) }
+        return nil
+    }
+}
+
 final class BarRowView: NSView {
     init(title: String, detail: String, value: Double) {
         super.init(frame: NSRect(x: 0, y: 0, width: 310, height: 63))
@@ -177,6 +386,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var snapshot = Snapshot()
     private var lastProjectRefresh = Date.distantPast
     private var refreshTimer: Timer?
+    private var isRefreshing = false
+    private var refreshFailed = false
     private let defaults = UserDefaults.standard
     private let codexBundleID = "com.openai.codex"
 
@@ -185,20 +396,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         set { defaults.set(newValue, forKey: "showWeekly") }
     }
 
+    private var showFiveHour: Bool {
+        get { defaults.object(forKey: "showFiveHour") as? Bool ?? false }
+        set { defaults.set(newValue, forKey: "showFiveHour") }
+    }
+
+    /// Keeps the app alive as a lightweight menu-bar process so it can react
+    /// to the next Codex launch in the same login session.
     private var followCodexLaunch: Bool {
         get { defaults.bool(forKey: "followCodexLaunch") }
         set { defaults.set(newValue, forKey: "followCodexLaunch") }
     }
 
-    private var followCodexQuit: Bool {
-        get { defaults.bool(forKey: "followCodexQuit") }
-        set { defaults.set(newValue, forKey: "followCodexQuit") }
+    private var quitWithCodex: Bool {
+        get {
+            defaults.object(forKey: "quitWithCodex") as? Bool
+                ?? defaults.bool(forKey: "followCodexQuit")
+        }
+        set { defaults.set(newValue, forKey: "quitWithCodex") }
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        if CommandLine.arguments.contains("--check-usage") {
+            let started = Date()
+            if let live = CodexAppServerReader.liveSnapshot() {
+                print("fiveHourRemaining=\(live.fiveHour?.remaining ?? -1) weeklyRemaining=\(live.weekly?.remaining ?? -1) elapsed=\(Date().timeIntervalSince(started))")
+                exit(0)
+            }
+            print("Live quota request failed or timed out")
+            exit(1)
+        }
+        NSApp.setActivationPolicy(.accessory)
         menu.delegate = self
         statusItem.menu = menu
-        statusItem.button?.toolTip = tr("Usage Bar for CodeX（每周剩余）", "Usage Bar for CodeX (weekly remaining)")
+        statusItem.button?.toolTip = tr("CodeX Usage Bar（每周余量）", "CodeX Usage Bar (weekly remaining)")
         statusItem.button?.imagePosition = .imageLeading
         observeCodexLifecycle()
         refreshTimer = Timer.scheduledTimer(withTimeInterval: 10 * 60, repeats: true) { [weak self] _ in
@@ -207,6 +438,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         refresh()
         rebuildMenu()
         if followCodexLaunch && !isCodexRunning { statusItem.isVisible = false }
+        if CodexFolderAccess.shared.currentURL() == nil {
+            DispatchQueue.main.async { [weak self] in self?.chooseCodexFolder() }
+        }
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -220,27 +454,59 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func refresh() {
+        guard !isRefreshing else { return }
+        isRefreshing = true
+        refreshFailed = false
         let needsProjects = Date().timeIntervalSince(lastProjectRefresh) >= 60 * 60
-        let fresh = LocalCodexReader.snapshot(includeProjects: needsProjects)
-        if needsProjects {
-            snapshot = fresh
-            lastProjectRefresh = Date()
-        } else {
-            snapshot.weekly = fresh.weekly
-            snapshot.updatedAt = fresh.updatedAt
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            guard let self else { return }
+            let live = CodexAppServerReader.liveSnapshot()
+            DispatchQueue.main.async {
+                self.isRefreshing = false
+                self.refreshFailed = live == nil
+                if let live {
+                    self.snapshot.fiveHour = live.fiveHour
+                    self.snapshot.weekly = live.weekly
+                    self.snapshot.creditBalance = live.creditBalance
+                    self.snapshot.updatedAt = live.updatedAt
+                    self.snapshot.isLiveCodexData = true
+                }
+                self.updateTitle()
+                self.rebuildMenu()
+            }
+            if needsProjects {
+                let projects = LocalCodexReader.snapshot(includeProjects: true).projects
+                DispatchQueue.main.async {
+                    self.snapshot.projects = projects
+                    self.lastProjectRefresh = Date()
+                    self.rebuildMenu()
+                }
+            }
         }
-        updateTitle()
     }
 
     private func updateTitle() {
-        statusItem.button?.title = showWeekly ? percent(snapshot.weekly) : ""
-        statusItem.button?.image = quotaIcon(remaining: snapshot.weekly?.remaining)
+        let values = [
+            showFiveHour ? quotaText(snapshot.fiveHour, creditBalance: nil) : nil,
+            showWeekly ? quotaText(snapshot.weekly, creditBalance: snapshot.creditBalance) : nil,
+        ].compactMap { $0 }
+        statusItem.button?.title = values.joined(separator: "/")
+        statusItem.button?.image = quotaIcon(
+            fiveHourRemaining: snapshot.fiveHour?.remaining,
+            weeklyRemaining: snapshot.weekly?.remaining
+        )
     }
 
     private func rebuildMenu() {
         menu.removeAllItems()
-        addHeader("Usage Bar for CodeX")
-        addQuota(tr("每周余量", "Weekly Remaining"), snapshot.weekly)
+        addHeader("CodeX Usage Bar")
+        if isRefreshing {
+            addDisabled(tr("正在刷新实时额度…", "Refreshing live usage…"))
+        } else if refreshFailed {
+            addDisabled(tr("刷新失败 · 以下为上次成功读取值", "Refresh failed · showing last successful values"))
+        }
+        addQuota(tr("5 小时余量", "5-Hour Remaining"), snapshot.fiveHour, creditBalance: nil)
+        addQuota(tr("每周余量", "Weekly Remaining"), snapshot.weekly, creditBalance: snapshot.creditBalance)
 
         menu.addItem(.separator())
         addHeader(tr("本机近 7 天项目用量", "Local Project Usage · 7 Days"))
@@ -255,11 +521,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
 
         menu.addItem(.separator())
+        let chooseFolder = NSMenuItem(title: tr("选择 Codex 数据文件夹…", "Choose Codex Data Folder…"), action: #selector(chooseCodexFolder), keyEquivalent: "")
+        chooseFolder.target = self
+        menu.addItem(chooseFolder)
+        addToggle(tr("菜单栏显示 5 小时余量", "Show 5-hour remaining in menu bar"), action: #selector(toggleFiveHour), enabled: showFiveHour)
         addToggle(tr("菜单栏显示每周余量", "Show weekly remaining in menu bar"), action: #selector(toggleWeekly), enabled: showWeekly)
-        addToggle(tr("Codex 启动时显示 Usage Bar", "Show Usage Bar when Codex opens"), action: #selector(toggleFollowCodexLaunch), enabled: followCodexLaunch)
-        addToggle(tr("Codex 退出时隐藏 Usage Bar", "Hide Usage Bar when Codex quits"), action: #selector(toggleFollowCodexQuit), enabled: followCodexQuit)
+        addToggle(tr("Codex 启动时显示 CodeX Usage Bar", "Show CodeX Usage Bar when Codex opens"), action: #selector(toggleFollowCodexLaunch), enabled: followCodexLaunch)
+        addToggle(tr("Codex 退出时退出 CodeX Usage Bar", "Quit CodeX Usage Bar when Codex quits"), action: #selector(toggleQuitWithCodex), enabled: quitWithCodex)
+        addDisabled(tr("独立第三方本地工具", "Independent third-party local utility"))
         if let updated = snapshot.updatedAt {
-            addDisabled(tr("本地记录更新：", "Local record updated: ") + dateText(updated))
+            addDisabled(
+                tr(snapshot.isLiveCodexData ? "Codex 实时更新：" : "本地记录更新：",
+                   snapshot.isLiveCodexData ? "Codex live update: " : "Local record updated: ")
+                + dateText(updated)
+            )
         } else {
             addDisabled(tr("未找到 Codex 余量记录", "No Codex usage record found"))
         }
@@ -286,9 +561,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(item)
     }
 
-    private func addQuota(_ title: String, _ window: QuotaWindow?) {
+    private func addQuota(_ title: String, _ window: QuotaWindow?, creditBalance: Double?) {
         guard let window else {
             addRow(title: title, detail: tr("本机最新记录未返回此窗口", "Latest local record did not include this window"), value: 0)
+            return
+        }
+        if window.remaining <= 0, let creditBalance {
+            let detail = tr("额度已用完 · 可用余额", "Quota exhausted · available balance")
+            addRow(title: "\(title)  \(dollarText(creditBalance))", detail: detail, value: 0)
             return
         }
         addRow(title: "\(title)  \(Int(window.remaining.rounded()))%", detail: tr("重置：", "Resets: ") + dateText(window.reset), value: window.remaining)
@@ -313,8 +593,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(item)
     }
 
-    private func percent(_ window: QuotaWindow?) -> String {
-        window.map { "\(Int($0.remaining.rounded()))%" } ?? "--"
+    private func quotaText(_ window: QuotaWindow?, creditBalance: Double?) -> String {
+        if let window, window.remaining <= 0, let creditBalance {
+            return dollarText(creditBalance)
+        }
+        return window.map { "\(Int($0.remaining.rounded()))%" } ?? "--"
+    }
+
+    private func dollarText(_ amount: Double) -> String {
+        String(format: "US$%.2f", amount)
     }
 
     private func dateText(_ date: Date) -> String {
@@ -338,17 +625,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         rebuildMenu()
     }
 
-    @objc private func toggleFollowCodexLaunch() {
-        followCodexLaunch.toggle()
-        updateLoginItem()
-        statusItem.isVisible = !followCodexLaunch || isCodexRunning
+    @objc private func toggleFiveHour() {
+        showFiveHour.toggle()
+        updateTitle()
         rebuildMenu()
     }
 
-    @objc private func toggleFollowCodexQuit() {
-        followCodexQuit.toggle()
+    @objc private func toggleQuitWithCodex() {
+        quitWithCodex.toggle()
+        rebuildMenu()
+    }
+
+    @objc private func toggleFollowCodexLaunch() {
+        followCodexLaunch.toggle()
+        if followCodexLaunch {
+            // A terminated app cannot observe the next Codex launch. Keep it
+            // resident and hide its status item between Codex sessions.
+            quitWithCodex = false
+        }
         updateLoginItem()
-        if !followCodexQuit { statusItem.isVisible = true }
+        statusItem.isVisible = !followCodexLaunch || isCodexRunning
         rebuildMenu()
     }
 
@@ -371,8 +667,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func workspaceAppTerminated(_ notification: Notification) {
-        guard followCodexQuit, bundleID(from: notification) == codexBundleID else { return }
-        statusItem.isVisible = false
+        if followCodexLaunch, bundleID(from: notification) == codexBundleID {
+            statusItem.isVisible = false
+            return
+        }
+        guard quitWithCodex, bundleID(from: notification) == codexBundleID else { return }
+        NSApplication.shared.terminate(nil)
     }
 
     private func bundleID(from notification: Notification) -> String? {
@@ -383,14 +683,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard #available(macOS 13.0, *) else { return }
         let service = SMAppService.mainApp
         do {
-            if followCodexLaunch || followCodexQuit {
+            if followCodexLaunch {
                 if service.status != .enabled { try service.register() }
             } else if service.status == .enabled {
                 try service.unregister()
             }
         } catch {
-            // The menu settings remain useful for the current session even if macOS declines login-item registration.
+            // It still works for this login session if macOS declines the
+            // optional login-item registration.
         }
+    }
+
+    @objc private func chooseCodexFolder() {
+        guard CodexFolderAccess.shared.chooseFolder() != nil else { return }
+        lastProjectRefresh = .distantPast
+        refresh()
+        rebuildMenu()
     }
 
     private func appIcon() -> NSImage? {
@@ -398,38 +706,71 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return NSImage(contentsOf: url)
     }
 
-    private func quotaIcon(remaining: Double?) -> NSImage? {
-        guard let source = appIcon() else { return nil }
+    private func quotaIcon(fiveHourRemaining: Double?, weeklyRemaining: Double?) -> NSImage? {
         let size = NSSize(width: 18, height: 18)
         let image = NSImage(size: size)
         image.lockFocus()
         NSGraphicsContext.current?.imageInterpolation = .high
-        source.draw(in: NSRect(origin: .zero, size: size))
 
         let center = NSPoint(x: 9, y: 9)
-        let radius: CGFloat = 7
-        let track = NSBezierPath()
-        track.appendArc(withCenter: center, radius: radius, startAngle: 0, endAngle: 360)
-        track.lineWidth = 2
-        NSColor(calibratedWhite: 0.12, alpha: 1).setStroke()
-        track.stroke()
+        func ring(remaining: Double?, radius: CGFloat, lineWidth: CGFloat, color: NSColor) {
+            let track = NSBezierPath()
+            track.appendArc(withCenter: center, radius: radius, startAngle: 0, endAngle: 360)
+            track.lineWidth = lineWidth
+            NSColor(calibratedWhite: 0.7, alpha: 0.28).setStroke()
+            track.stroke()
 
-        if let remaining {
+            guard let remaining else { return }
             let value = max(0, min(100, remaining))
             let used = 100 - value
-            let ring = NSBezierPath()
-            ring.appendArc(
+            let progress = NSBezierPath()
+            progress.appendArc(
                 withCenter: center,
                 radius: radius,
                 startAngle: 90 - CGFloat(used / 100 * 360),
                 endAngle: -270,
                 clockwise: true
             )
-            ring.lineWidth = 2
-            ring.lineCapStyle = .round
-            NSColor(srgbRed: 0.16, green: 0.95, blue: 0.49, alpha: 1).setStroke()
-            ring.stroke()
+            progress.lineWidth = lineWidth
+            progress.lineCapStyle = .round
+            color.setStroke()
+            progress.stroke()
         }
+
+        // Outer blue ring: 5-hour remaining. Inner green ring: weekly remaining.
+        ring(
+            remaining: fiveHourRemaining,
+            radius: 8,
+            lineWidth: 1.15,
+            color: NSColor(srgbRed: 0.20, green: 0.58, blue: 1.0, alpha: 1)
+        )
+        ring(
+            remaining: weeklyRemaining,
+            radius: 6.15,
+            lineWidth: 1.8,
+            color: NSColor(srgbRed: 0.16, green: 0.95, blue: 0.49, alpha: 1)
+        )
+
+        // The status-bar glyph deliberately uses a transparent canvas instead
+        // of the full app icon, whose white rounded-square background becomes
+        // visually heavy at 18 pt.
+        let terminal = NSBezierPath()
+        terminal.move(to: NSPoint(x: 5.2, y: 11.6))
+        terminal.line(to: NSPoint(x: 7.8, y: 9))
+        terminal.line(to: NSPoint(x: 5.2, y: 6.4))
+        terminal.lineWidth = 1.7
+        terminal.lineCapStyle = .round
+        terminal.lineJoinStyle = .round
+        NSColor.white.setStroke()
+        terminal.stroke()
+
+        let cursor = NSBezierPath()
+        cursor.move(to: NSPoint(x: 9.4, y: 6.1))
+        cursor.line(to: NSPoint(x: 12.7, y: 6.1))
+        cursor.lineWidth = 1.7
+        cursor.lineCapStyle = .round
+        NSColor.white.setStroke()
+        cursor.stroke()
 
         image.unlockFocus()
         image.isTemplate = false
@@ -439,18 +780,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func quitApp() { NSApplication.shared.terminate(nil) }
 }
 
-if CommandLine.arguments.contains("--self-test") {
-    exit(LocalCodexReader.selfTest() ? 0 : 1)
-}
+//
+//  CodeXUsageBarApp.swift
+//  CodeXUsageBar
+//
+//  Created by Daniel Dai on 2026/8/15.
+//
 
-if CommandLine.arguments.contains("--snapshot") {
-    let value = LocalCodexReader.snapshot()
-    print("weekly=\(value.weekly.map { Int($0.remaining) } ?? -1) projects=\(value.projects.count)")
-    exit(0)
-}
+import SwiftUI
 
-let app = NSApplication.shared
-let delegate = AppDelegate()
-app.delegate = delegate
-app.setActivationPolicy(.accessory)
-app.run()
+@main
+struct CodeXUsageBarApp: App {
+    @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
+
+    var body: some Scene {
+        Settings {
+            EmptyView()
+        }
+    }
+}
